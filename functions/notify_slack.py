@@ -1,88 +1,91 @@
-from __future__ import print_function
-import os, boto3, json, base64
-import urllib.request, urllib.parse
+import os
 import logging
+import json
+import boto3
+
+from base64 import b64decode
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+
+ENCRYPTED_HOOK_URL = os.environ['kmsEncryptedHookUrl']
+SLACK_CHANNEL = os.environ['slackChannel']
+
+SLACK_WEBHOOK_URL = boto3.client('kms').decrypt(CiphertextBlob=b64decode(ENCRYPTED_HOOK_URL))['Plaintext'].decode(
+    'utf-8')
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 
-# Decrypt encrypted URL with KMS
-def decrypt(encrypted_url):
-    region = os.environ['AWS_REGION']
-    try:
-        kms = boto3.client('kms', region_name=region)
-        plaintext = kms.decrypt(CiphertextBlob=base64.b64decode(encrypted_url))['Plaintext']
-        return plaintext.decode()
-    except Exception:
-        logging.exception("Failed to decrypt URL with KMS")
+def lambda_handler(event, context):
+    logger.info("Event: " + str(event))
+    message = json.loads(event['Records'][0]['Sns']['Message'])
+    logger.info("Message: " + str(message))
 
+    region = message['region']
+    pipeline_name = message['detail']['pipeline']
+    state = message['detail']['state']
 
-def cloudwatch_notification(message, region):
-    states = {'OK': 'good', 'INSUFFICIENT_DATA': 'warning', 'ALARM': 'danger'}
-
-    return {
-            "color": states[message['NewStateValue']],
-            "fallback": "Alarm {} triggered".format(message['AlarmName']),
-            "fields": [
-                { "title": "Alarm Name", "value": message['AlarmName'], "short": True },
-                { "title": "Alarm Description", "value": message['AlarmDescription'], "short": False},
-                { "title": "Alarm reason", "value": message['NewStateReason'], "short": False},
-                { "title": "Old State", "value": message['OldStateValue'], "short": True },
-                { "title": "Current State", "value": message['NewStateValue'], "short": True },
+    if state == "STARTED":
+        slack_message = {
+            "channel": SLACK_CHANNEL,
+            "attachments": [
                 {
-                    "title": "Link to Alarm",
-                    "value": "https://console.aws.amazon.com/cloudwatch/home?region=" + region + "#alarm:alarmFilter=ANY;name=" + urllib.parse.quote_plus(message['AlarmName']),
-                    "short": False
+                    "pretext": "%sによるサーバーの更新が開始されました。" % (pipeline_name),
+                    "color": "#04B404",
+                    "title": "AWS CodePipeline",
+                    "fields": [
+                        {
+                            "title": "%s" % (pipeline_name)
+                        }
+                    ],
+                    "title_link": "https://%s.console.aws.amazon.com/codepipeline/home?region=%s#/view/%s" % (region, region, pipeline_name)
+                }
+            ]
+        }
+    elif state == "SUCCEEDED":
+        slack_message = {
+            'channel': SLACK_CHANNEL,
+            'attachments': [
+                {
+                    "pretext": "%sによるサーバーの更新が正常に終了しました。" % (pipeline_name),
+                    "color": "#0174DF",
+                    "title": "AWS CodePipeline",
+                    "fields": [
+                        {
+                            "title": "%s" % (pipeline_name)
+                        }
+                    ],
+                    "title_link": "https://%s.console.aws.amazon.com/codepipeline/home?region=%s#/view/%s" % (region, region, pipeline_name)
+                }
+            ]
+        }
+    else:
+        slack_message = {
+            'channel': SLACK_CHANNEL,
+            'attachments': [
+                {
+                    "pretext": "%sの実行中にエラーが発生しました。" % (pipeline_name),
+                    "color": "#FF0040",
+                    "title": "AWS CodePipeline",
+                    "fields": [
+                        {
+                            "title": "%s" % (pipeline_name)
+                        }
+                    ],
+                    "title_link": "https://%s.console.aws.amazon.com/codepipeline/home?region=%s#/view/%s" % (region, region, pipeline_name)
                 }
             ]
         }
 
+    request = Request(SLACK_WEBHOOK_URL, json.dumps(slack_message).encode('utf-8'))
 
-def default_notification(subject, message):
-    return {
-            "fallback": "A new message",
-            "fields": [{"title": subject if subject else "Message", "value": json.dumps(message), "short": False}]
-        }
+    try:
+        response = urlopen(request)
+        response.read()
+        logger.info("%sというメッセージを投稿しました。", slack_message['channel'])
+    except HTTPError as e:
+        logger.error("%sへのメッセージの投稿にエラーが発生しました。%d",e.reason,e.code)
+    except URLError as e:
+        logger.error("サーバーへの接続に失敗しました。%s", e.reason)
 
-
-# Send a message to a slack channel
-def notify_slack(subject, message, region):
-    slack_url = os.environ['SLACK_WEBHOOK_URL']
-    if not slack_url.startswith("http"):
-        slack_url = decrypt(slack_url)
-
-    slack_channel = os.environ['SLACK_CHANNEL']
-    slack_username = os.environ['SLACK_USERNAME']
-    slack_emoji = os.environ['SLACK_EMOJI']
-
-    payload = {
-        "channel": slack_channel,
-        "username": slack_username,
-        "icon_emoji": slack_emoji,
-        "attachments": []
-    }
-    if type(message) is str:
-        try:
-            message = json.loads(message)
-        except json.JSONDecodeError as err:
-            logging.exception(f'JSON decode error: {err}')
-    if "AlarmName" in message:
-        notification = cloudwatch_notification(message, region)
-        payload['text'] = "AWS CloudWatch notification - " + message["AlarmName"]
-        payload['attachments'].append(notification)
-    else:
-        payload['text'] = "AWS notification"
-        payload['attachments'].append(default_notification(subject, message))
-
-    data = urllib.parse.urlencode({"payload": json.dumps(payload)}).encode("utf-8")
-    req = urllib.request.Request(slack_url)
-    urllib.request.urlopen(req, data)
-
-
-def lambda_handler(event, context):
-    subject = event['Records'][0]['Sns']['Subject']
-    message = event['Records'][0]['Sns']['Message']
-    region = event['Records'][0]['Sns']['TopicArn'].split(":")[3]
-    notify_slack(subject, message, region)
-
-    return message
-
-#notify_slack({"AlarmName":"Example","AlarmDescription":"Example alarm description.","AWSAccountId":"000000000000","NewStateValue":"ALARM","NewStateReason":"Threshold Crossed","StateChangeTime":"2017-01-12T16:30:42.236+0000","Region":"EU - Ireland","OldStateValue":"OK"}, "eu-west-1")
