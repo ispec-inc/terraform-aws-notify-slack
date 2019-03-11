@@ -7,15 +7,11 @@ from base64 import b64decode
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
-ENCRYPTED_HOOK_URL = os.environ['kmsEncryptedHookUrl']
-SLACK_CHANNEL = os.environ['slackChannel']
-
-SLACK_WEBHOOK_URL = boto3.client('kms').decrypt(CiphertextBlob=b64decode(ENCRYPTED_HOOK_URL))['Plaintext'].decode(
-    'utf-8')
+SLACK_CHANNEL = os.environ['SLACK_CHANNEL']
+SLACK_WEBHOOK_URL = os.environ['SLACK_WEBHOOK_URL'] 
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-
 
 def lambda_handler(event, context):
     logger.info("Event: " + str(event))
